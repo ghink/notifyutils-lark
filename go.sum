@@ -1,0 +1,4 @@
+go.gh.ink/notifyutils v1.0.0 h1:+7fi9qS7FJQhlyU8dGym67jrwvqzdZ2eqBWB5ye6hFg=
+go.gh.ink/notifyutils v1.0.0/go.mod h1:abhdluOcerRwBJZoafr3ZzHMPPJQQtNw+l+x5gTkCng=
+go.gh.ink/toolbox v1.14.1 h1:qTEX5LA++ZhLEsr9CVgxql6v1kDfuQyOhM9eX1VKeQ4=
+go.gh.ink/toolbox v1.14.1/go.mod h1:WlVlSZL+yKIOV9bINXQVnBxVLegXOP9vcL+1+6oBQM8=

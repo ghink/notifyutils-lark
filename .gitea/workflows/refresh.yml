@@ -1,0 +1,136 @@
+name: Test and refresh gosumdb
+
+on:
+  release:
+    types: [published]
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+      - '*'
+
+jobs:
+  ci:
+    runs-on: node-24-alpine
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install deps (apk)
+        shell: sh
+        run: |
+          set -e
+          sed -i 's#https\?://dl-cdn.alpinelinux.org/alpine#http://mirrors.98e-1.net/alpine#g' /etc/apk/repositories
+          apk update
+          apk add --no-cache git ca-certificates curl tar xz
+
+      # The module sits at the repository root: this family publishes v1, which
+      # needs neither a /vN import suffix nor a versioned subdirectory.
+      - name: Resolve the Go version and install it if needed
+        id: go
+        shell: sh
+        run: |
+          set -eux
+          
+          want=$(awk '/^go /{print $2; exit}' go.mod || true)
+          if [ -z "$want" ]; then
+            echo "No 'go' directive found in go.mod, defaulting to 1.26"
+            want=1.26
+          fi
+          case "$want" in
+            *.*.*) ;;
+            *.*) want="$want.0" ;;
+          esac
+          echo "go-version=$want" >> $GITHUB_OUTPUT
+          echo "Requiring Go $want"
+          
+          if command -v go >/dev/null 2>&1; then
+            have=$(go version | awk '{print $3}' | sed 's/^go//')
+          else
+            have=""
+          fi
+          
+          version_ge() {
+            awk -v a="$1" -v b="$2" 'BEGIN{
+              split(a, A, "."); split(b, B, ".");
+              for (i=1; i<=3; i++) {
+                ai = (i in A) ? A[i] : 0;
+                bi = (i in B) ? B[i] : 0;
+                if (ai+0 > bi+0) exit 0;
+                if (ai+0 < bi+0) exit 1;
+              }
+              exit 0;
+            }'
+          }
+          
+          if [ -n "$have" ] && version_ge "$have" "$want"; then
+            echo "Existing Go $have is sufficient"
+            exit 0
+          fi
+          
+          echo "Installing Go $want because the runner has '$have'"
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64|amd64) goarch="amd64" ;;
+            aarch64|arm64) goarch="arm64" ;;
+            *) goarch="amd64" ;;
+          esac
+          url="http://mirrors.98e-1.net/golang/go${want}.linux-${goarch}.tar.gz"
+          curl -fsSL -o /tmp/go.tgz "$url"
+          rm -rf /usr/local/go || true
+          tar -C /usr/local -xzf /tmp/go.tgz
+          echo "PATH=/usr/local/go/bin:$PATH" >> $GITHUB_ENV
+          # GITHUB_ENV only reaches later steps, so the current one needs it exported too.
+          export PATH=/usr/local/go/bin:$PATH
+          go version
+
+      - name: Fetch tags
+        shell: sh
+        run: |
+          git fetch --tags --prune --force origin || true
+
+      - name: Run go tests
+        if: "startsWith(github.ref, 'refs/heads/') || startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'"
+        shell: sh
+        env:
+          GOPROXY: https://goproxy.cn,direct
+        run: |
+          set -eux
+          go vet ./...
+          go test ./... -v
+
+      - name: Refresh gosumdb (tag/release only)
+        if: "startsWith(github.ref, 'refs/tags/') || github.event_name == 'release'"
+        shell: sh
+        env:
+          GOPROXY: https://goproxy.cn,direct
+        run: |
+          set -eux
+          
+          module=$(awk '/^module /{print $2; exit}' go.mod)
+          echo "Detected module: $module"
+          
+          tag=""
+          if [ -n "${GITHUB_REF:-}" ]; then
+            tag=${GITHUB_REF#refs/tags/}
+          fi
+          tag=${tag:-${GITEA_RELEASE_TAG:-${EVENT_RELEASE_TAG:-}}}
+          if [ -z "$tag" ]; then
+            tag=$(git describe --tags --exact-match 2>/dev/null || true)
+          fi
+          if [ -z "$tag" ]; then
+            echo "No tag found for this run — nothing to refresh. Exiting."
+            exit 0
+          fi
+          
+          echo "Refreshing gosumdb for $module@$tag"
+          TMPDIR=$(mktemp -d)
+          cd "$TMPDIR"
+          printf '%s\n' 'module refresh-gosumdb-temp' '' "go ${{ steps.go.outputs.go-version }}" > go.mod
+          env GOSUMDB=sum.golang.org GOFLAGS='' go get "$module@$tag"
+          cd - >/dev/null || true
+          rm -rf "$TMPDIR"
