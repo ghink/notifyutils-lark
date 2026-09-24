@@ -687,3 +687,237 @@ func TestSendDoesNotMutateMessage(t *testing.T) {
 		t.Errorf("Extras were rewritten: %v", msg.Extras)
 	}
 }
+
+func TestNewClientRefusesContradictoryCardConfig(t *testing.T) {
+	srv, _ := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+
+	tests := map[string]map[string]string{
+		"both card modes":      {CardTemplate: `{"schema":"2.0"}`, CardTemplateID: "AAqy"},
+		"variables without id": {CardVariables: `{"content":"{{.Text}}"}`},
+		"version without id":   {CardTemplateVersion: "1.0.0"},
+		"variables not json":   {CardTemplateID: "AAqy", CardVariables: `not json`},
+		// A numeric variable value would let a phone-like value arrive re-typed, so
+		// only strings are accepted.
+		"variable not a string": {CardTemplateID: "AAqy", CardVariables: `{"peer":13800138000}`},
+		"card json unparsable":  {CardTemplate: `{"schema":"{{.Text}`},
+		"variable unparsable":   {CardTemplateID: "AAqy", CardVariables: `{"content":"{{.Text"}`},
+	}
+
+	for name, credential := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Driver{}.NewClient(paramsFor(srv, credential))
+			if !stderrors.Is(err, errors.ErrDriverCredentialInvalid) {
+				t.Fatalf("error = %v, want ErrDriverCredentialInvalid", err)
+			}
+			var typed *errors.NotifyutilsError
+			if !stderrors.As(err, &typed) || typed.DriverName() != Name {
+				t.Errorf("error should name the driver, got %v", err)
+			}
+		})
+	}
+}
+
+func TestSendBuildsTemplateCardEnvelope(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplateID:      "AAqyBQVmUN0w",
+		CardTemplateVersion: "1.0.0",
+		CardVariables:       `{"content":"{{.Text}}","peer":"{{.Extras.peer}}","hotline":"13800138000"}`,
+	})
+
+	// A title and a mention list must not be refused here: the template can place them,
+	// and unlike a verbatim card the driver wrote the card itself.
+	err := client.Send(context.Background(), model.Message{
+		Title:      "磁盘告警",
+		Text:       "db-02 已用 92%",
+		Format:     model.FormatMarkdown,
+		Recipients: []string{"ou_peer"},
+		Extras:     map[string]any{"peer": "老板"},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	payload := decode(t, got.body)
+	if payload["msg_type"] != MsgTypeInteractive {
+		t.Errorf("msg_type = %v, want interactive", payload["msg_type"])
+	}
+	if stringField(t, payload, "card", "type") != CardTemplateType {
+		t.Errorf("card.type = %v, want %q", payload["card"], CardTemplateType)
+	}
+	if stringField(t, payload, "card", "data", "template_id") != "AAqyBQVmUN0w" {
+		t.Errorf("template_id = %v", field(t, payload, "card", "data", "template_id"))
+	}
+	if stringField(t, payload, "card", "data", "template_version_name") != "1.0.0" {
+		t.Errorf("template_version_name = %v", field(t, payload, "card", "data", "template_version_name"))
+	}
+
+	variables := object(t, payload, "card", "data", "template_variable")
+	if variables["content"] != "db-02 已用 92%" {
+		t.Errorf("content = %v, want the rendered body", variables["content"])
+	}
+	if variables["peer"] != "老板" {
+		t.Errorf("peer = %v, want the Extras value", variables["peer"])
+	}
+	// A phone-shaped literal stays a string: as a JSON number it would arrive rewritten.
+	if hotline, ok := variables["hotline"].(string); !ok || hotline != "13800138000" {
+		t.Errorf("hotline = %#v, want the string 13800138000", variables["hotline"])
+	}
+}
+
+func TestSendOmitsVersionWhenUnconfigured(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplateID: "AAqyBQVmUN0w",
+		CardVariables:  `{"content":"{{.Text}}"}`,
+	})
+
+	if err := client.Send(context.Background(), model.Message{Text: "x"}); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	data := object(t, decode(t, got.body), "card", "data")
+	if _, present := data["template_version_name"]; present {
+		t.Errorf("data = %v, want no template_version_name", data)
+	}
+}
+
+func TestSendRendersJSONCardTemplate(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	// Interpolating into JSON text needs the json helper: it emits the value as an
+	// escaped string literal, quotes included, so the template leaves them out.
+	client := clientFor(t, srv, map[string]string{
+		CardTemplate: `{"schema":"2.0","header":{"title":{"tag":"plain_text","content":{{json .Title}}}},"body":{"elements":[{"tag":"markdown","content":{{json .Text}}}]}}`,
+	})
+
+	// Quotes and newlines inside the message must not break out of the card's JSON
+	// string: the template fills Go values, and Marshal does the escaping.
+	msg := model.Message{
+		Title:  `发布 "失败"`,
+		Text:   "第一行\n第二行 \"引号\"",
+		Format: model.FormatMarkdown,
+	}
+	if err := client.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	payload := decode(t, got.body)
+	if stringField(t, payload, "card", "header", "title", "content") != `发布 "失败"` {
+		t.Errorf("header = %v", field(t, payload, "card", "header", "title", "content"))
+	}
+	list := elements(t, payload)
+	if list[0]["content"] != "第一行\n第二行 \"引号\"" {
+		t.Errorf("element content = %v, want the text kept intact", list[0]["content"])
+	}
+}
+
+// A card template reads the message exactly as delivered; binding model.Vars into
+// Title and Text is the core's step, covered by its own tests.
+func TestSendCardTemplateReadsMessageText(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplate: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":{{json .Text}}}]}}`,
+	})
+
+	err := client.Send(context.Background(), model.Message{
+		Text:  "主机 web-01 已用 92%",
+		Level: model.LevelWarn,
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	if content := elements(t, decode(t, got.body))[0]["content"]; content != "主机 web-01 已用 92%" {
+		t.Errorf("content = %v, want the message text as given", content)
+	}
+}
+
+// Without the json helper a quote in the text corrupts the card. That has to fail loudly
+// rather than send a document the upstream might half-parse.
+func TestSendCardTemplateRefusesUnescapedInterpolation(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplate: `{"schema":"2.0","header":{"title":{"tag":"plain_text","content":"{{.Title}}"}}}`,
+	})
+
+	err := client.Send(context.Background(), model.Message{Title: `发布 "失败"`})
+	if !stderrors.Is(err, errors.ErrDriverSendFailed) {
+		t.Fatalf("error = %v, want ErrDriverSendFailed for a card broken by an unescaped quote", err)
+	}
+	if got.count() != 0 {
+		t.Errorf("requests = %d, want nothing sent when the rendered card is not valid JSON", got.count())
+	}
+}
+
+// A card from the credentials is the default; a card on the message overrides it.
+func TestSendExtraCardBeatsCredentialCard(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplateID: "AAqyBQVmUN0w",
+		CardVariables:  `{"content":"{{.Text}}"}`,
+	})
+
+	err := client.Send(context.Background(), model.Message{
+		Text:   "x",
+		Extras: map[string]any{ExtraCard: `{"schema":"2.0","body":{"elements":[{"tag":"markdown","content":"per message"}]}}`},
+	})
+	if err != nil {
+		t.Fatalf("Send() error = %v", err)
+	}
+
+	list := elements(t, decode(t, got.body))
+	if list[0]["content"] != "per message" {
+		t.Errorf("elements = %v, want the per-message card", list)
+	}
+	// field() would fail on an absent key, so read the card map directly here.
+	card, ok := decode(t, got.body)["card"].(map[string]any)
+	if !ok {
+		t.Fatalf("card = %v, want an object", decode(t, got.body)["card"])
+	}
+	if _, present := card["type"]; present {
+		t.Errorf("card.type = %v, want no template envelope when ExtraCard is given", card["type"])
+	}
+}
+
+// An absent Extras key must fail the send rather than put Go's "<no value>" into a card.
+func TestSendCardTemplateFailsOnMissingExtrasKey(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{
+		CardTemplateID: "AAqy",
+		CardVariables:  `{"peer":"{{.Extras.peer}}"}`,
+	})
+
+	err := client.Send(context.Background(), model.Message{Text: "x"})
+	if !stderrors.Is(err, errors.ErrDriverSendFailed) {
+		t.Fatalf("error = %v, want ErrDriverSendFailed", err)
+	}
+	if got.count() != 0 {
+		t.Errorf("requests = %d, want the failure to happen before any send", got.count())
+	}
+	var typed *errors.NotifyutilsError
+	if stderrors.As(err, &typed) && !strings.Contains(typed.DriverMessage(), "peer") {
+		t.Errorf("DriverMessage() = %q, want it to name the failing template", typed.DriverMessage())
+	}
+}
+
+func TestSendCardTemplateRejectsNonCardRender(t *testing.T) {
+	srv, got := server(200, `{"code":0,"msg":"success"}`)
+	defer srv.Close()
+	client := clientFor(t, srv, map[string]string{CardTemplate: `"just a string"`})
+
+	err := client.Send(context.Background(), model.Message{Text: "x"})
+	if !stderrors.Is(err, errors.ErrDriverSendFailed) {
+		t.Fatalf("error = %v, want ErrDriverSendFailed", err)
+	}
+	if got.count() != 0 {
+		t.Errorf("requests = %d, want nothing sent for a card that is not an object", got.count())
+	}
+}

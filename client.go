@@ -3,6 +3,7 @@ package lark
 import (
 	"net/http"
 	"net/url"
+	"text/template"
 
 	"go.gh.ink/notifyutils/errors"
 	"go.gh.ink/notifyutils/model"
@@ -17,6 +18,16 @@ type Client struct {
 	// Secret is empty when the robot has no 签名校验 configured, and then the
 	// request carries neither timestamp nor sign.
 	Secret string
+
+	// Card defaults, all optional and compiled at construction so a broken template
+	// fails when the channel is built rather than on the first alert.
+	// CardTemplate is a whole card JSON rendered against model.Message;
+	// CardTemplateID names a 搭建工具 template whose placeholders are filled from
+	// CardVariables, whose values are rendered the same way. Setting both is refused.
+	CardTemplate        *template.Template
+	CardTemplateID      string
+	CardTemplateVersion string
+	CardVariables       map[string]*template.Template
 
 	Client *http.Client
 
@@ -41,7 +52,7 @@ func (d Driver) NewClient(params model.DriverClientParam) (model.Client, error) 
 			WithDriverResponse(webhook)
 	}
 
-	return Client{
+	client := Client{
 		Webhook: webhook,
 		Secret:  params.Credential[Secret],
 
@@ -49,5 +60,91 @@ func (d Driver) NewClient(params model.DriverClientParam) (model.Client, error) 
 
 		Marshal:   params.Marshal,
 		Unmarshal: params.Unmarshal,
-	}, nil
+	}
+
+	if err := client.configureCards(params.Credential); err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}
+
+// configureCards compiles the card credentials. Every rejection here is a combination
+// that would otherwise send something the upstream reads as a valid request but not as
+// the card the configuration describes.
+func (c *Client) configureCards(credential map[string]string) error {
+	rawCard := credential[CardTemplate]
+	rawID := credential[CardTemplateID]
+	rawVariables := credential[CardVariables]
+
+	if rawCard != "" && rawID != "" {
+		return credentialProblem("cardTemplate and cardTemplateID are alternatives: pick one card mode")
+	}
+	if rawVariables != "" && rawID == "" {
+		return credentialProblem("cardVariables needs cardTemplateID to fill")
+	}
+	if credential[CardTemplateVersion] != "" && rawID == "" {
+		return credentialProblem("cardTemplateVersion needs cardTemplateID to qualify")
+	}
+
+	if rawCard != "" {
+		parsed, err := c.cardTemplate(CardTemplate).Parse(rawCard)
+		if err != nil {
+			return credentialProblem(CardTemplate + ": " + err.Error())
+		}
+		c.CardTemplate = parsed
+		return nil
+	}
+
+	if rawID == "" {
+		return nil
+	}
+	c.CardTemplateID = rawID
+	c.CardTemplateVersion = credential[CardTemplateVersion]
+
+	if rawVariables == "" {
+		return nil
+	}
+
+	// Values stay strings all the way in: a variable rendered as a JSON number would
+	// let a phone-like value arrive re-typed, and the card offers no way to notice.
+	var variables map[string]string
+	if err := c.Unmarshal([]byte(rawVariables), &variables); err != nil {
+		return credentialProblem(CardVariables + " must be a JSON object of template strings: " + err.Error())
+	}
+
+	compiled := make(map[string]*template.Template, len(variables))
+	for key, text := range variables {
+		parsed, err := c.cardTemplate(key).Parse(text)
+		if err != nil {
+			return credentialProblem(CardVariables + " [" + key + "]: " + err.Error())
+		}
+		compiled[key] = parsed
+	}
+	c.CardVariables = compiled
+
+	return nil
+}
+
+// cardTemplate starts a compiled card template with the driver's options and helpers.
+//
+// The json helper exists because a whole-card template writes into JSON text: a title
+// containing a quote or a newline interpolated as {{.Title}} breaks the document, while
+// {{json .Title}} emits it as an escaped JSON string literal, quotes included.
+func (c Client) cardTemplate(name string) *template.Template {
+	return template.New(name).Option(missingKeyOption).Funcs(template.FuncMap{
+		"json": func(value any) (string, error) {
+			encoded, err := c.Marshal(value)
+			if err != nil {
+				return "", err
+			}
+			return string(encoded), nil
+		},
+	})
+}
+
+func credentialProblem(message string) error {
+	return errors.ErrDriverCredentialInvalid.
+		WithDriverName(Name).
+		WithDriverMessage(message)
 }

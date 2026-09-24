@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"text/template"
 
 	"go.gh.ink/notifyutils/errors"
 	"go.gh.ink/notifyutils/model"
@@ -160,6 +161,18 @@ func (c Client) build(msg model.Message) (*Payload, error) {
 		return &Payload{MsgType: MsgTypeInteractive, Card: card}, nil
 	}
 
+	// A card described in the credentials instead: the message supplies the values and
+	// the template owns the layout. Unlike ExtraCard this does not refuse a title or a
+	// mention list, because the template can place both where it wants them.
+	if c.CardTemplate != nil || c.CardTemplateID != "" {
+		card, err := c.credentialCard(msg)
+		if err != nil {
+			return nil, err
+		}
+
+		return &Payload{MsgType: MsgTypeInteractive, Card: card}, nil
+	}
+
 	switch msg.Format {
 	case model.FormatPlain:
 		// A text message has no headline slot, so the title folds into the first
@@ -220,6 +233,57 @@ func (c Client) card(raw any) (any, error) {
 	}
 
 	return parsed, nil
+}
+
+// credentialCard builds the card the credentials describe. Both branches hand back Go
+// values rather than assembled text: the request body is then encoded by Marshal, which
+// is what keeps a rendered value containing quotes or a newline from breaking out of its
+// JSON string. Rendering JSON by hand would need escaping rules this driver would have
+// to get right on its own.
+func (c Client) credentialCard(msg model.Message) (any, error) {
+	if c.CardTemplate != nil {
+		rendered, err := renderCard(c.CardTemplate, CardTemplate, msg)
+		if err != nil {
+			return nil, err
+		}
+
+		// Reuses the ExtraCard validation, so a template that renders to something other
+		// than a card object is refused before the request goes out.
+		return c.card(rendered)
+	}
+
+	data := map[string]any{"template_id": c.CardTemplateID}
+	if c.CardTemplateVersion != "" {
+		data["template_version_name"] = c.CardTemplateVersion
+	}
+
+	if len(c.CardVariables) > 0 {
+		variables := make(map[string]string, len(c.CardVariables))
+		for key, text := range c.CardVariables {
+			value, err := renderCard(text, CardVariables+" ["+key+"]", msg)
+			if err != nil {
+				return nil, err
+			}
+			variables[key] = value
+		}
+		data["template_variable"] = variables
+	}
+
+	return map[string]any{"type": CardTemplateType, "data": data}, nil
+}
+
+// renderCard runs one compiled card template against the message. The core has already
+// bound model.Vars into Title and Text, so a card template reads finished strings.
+func renderCard(text *template.Template, what string, msg model.Message) (string, error) {
+	var out strings.Builder
+
+	if err := text.Execute(&out, msg); err != nil {
+		return "", errors.ErrDriverSendFailed.
+			WithDriverName(Name).
+			WithDriverMessage(what + ": " + err.Error())
+	}
+
+	return out.String(), nil
 }
 
 // mentions resolves whom the message @s. Recipients and ExtraAtUserIDs both hold

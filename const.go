@@ -12,6 +12,20 @@ const Webhook = "webhook"
 // and only needed when that setting is on: the hook URL alone is enough otherwise.
 const Secret = "secret"
 
+// Card credentials. A card can arrive per message through ExtraCard, or be described
+// once here so an application sends cards without knowing Lark's card JSON:
+// CardTemplateID addresses a 搭建工具 template, CardVariables supplies the strings its
+// placeholders name, and CardTemplate is a whole card JSON of your own. The two card
+// modes are alternatives, and pairing them is a configuration error at construction.
+const CardTemplateID = "cardTemplateID"
+const CardTemplateVersion = "cardTemplateVersion"
+const CardVariables = "cardVariables"
+const CardTemplate = "cardTemplate"
+
+// CardTemplateType is the envelope tag for a 搭建工具 card, as opposed to a card
+// written out as JSON.
+const CardTemplateType = "template"
+
 // ContentType is the header the documentation's curl example sends.
 const ContentType = "application/json"
 
@@ -59,3 +73,11 @@ const (
 	// also ask for mentions, which cannot be injected into someone else's card.
 	ExtraCard = "lark/card"
 )
+
+// missingKeyOption governs a card template that names an absent map key. Field-style
+// lookups ({{.Extras.peer}}) then fail the send instead of putting Go's literal
+// "<no value>" into a card nobody wrote; measured, "missingkey=zero" would not help,
+// because the zero value of a map[string]any element is a nil interface, which prints as
+// <no value> anyway. index-style lookups ({{index .Extras "peer-id"}}) are not covered by
+// this option and still render <no value>, so prefer the field style for optional keys.
+const missingKeyOption = "missingkey=error"

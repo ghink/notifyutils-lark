@@ -13,6 +13,7 @@ already exists. This driver needs none of that, so it is standard library only, 
 |-----|----------|---------|
 | `webhook` | yes | The hook URL, token included: `https://open.feishu.cn/open-apis/bot/v2/hook/<token>` |
 | `secret` | no | The 密钥 behind the robot's 签名校验 security setting. Empty means no signature is computed or sent |
+| `cardTemplateID`, `cardTemplateVersion`, `cardVariables`, `cardTemplate` | no | Describe a card once in config instead of per message: see [Cards from the credentials](#cards-from-the-credentials) |
 
 A missing `webhook` fails at `NewClient` with `errors.ErrDriverCredentialInvalid`. The robot's other
 two security settings — 关键词 and IP 白名单 — are server-side and need nothing here; a message that
@@ -38,13 +39,54 @@ Titles: a card has a headline slot, so `msg.Title` becomes `card.header.title` (
 omitted entirely when there is no title). A text message has none, so the title folds onto the first
 line.
 
+## Cards from the credentials
+
+A card does not have to be written by the sending code. Four credentials describe it once, and the
+driver assembles and renders the card per message. The template dot is `model.Message` — the same
+documented context as every other channel here, with `Vars` already bound into `Title` and `Text` by
+the core.
+
+| Key | Meaning |
+|-----|---------|
+| `cardTemplateID` | A card built in the 卡片搭建工具, referenced by its template id |
+| `cardTemplateVersion` | Optional `template_version_name` for that template |
+| `cardVariables` | JSON object mapping the template's placeholder names to **template strings**, e.g. `{"content":"{{.Text}}"}` |
+| `cardTemplate` | A whole card JSON of your own, rendered the same way — the alternative to `cardTemplateID` |
+
+```go
+credential := map[string]string{
+	lark.Webhook:         "https://open.feishu.cn/open-apis/bot/v2/hook/…",
+	lark.CardTemplateID:  "AAqyBQVmUN0w",
+	lark.CardVariables:   `{"content":"{{.Text}}","peer":"{{.Extras.peer}}"}`,
+}
+```
+
+Decisions the driver makes so callers do not have to:
+
+- **Variable values are always strings.** `cardVariables` must decode to `map[string]string`, so a
+  phone-shaped value such as `13800138000` reaches the card as text rather than being re-typed as
+  `1.38e+10` by a JSON number.
+- **The envelope is assembled from Go values**, then encoded once: quotes and newlines inside a
+  rendered variable cannot break out of their JSON string.
+- **`{{json …}}` for whole-card templates.** `cardTemplate` interpolates into JSON *text*, so
+  `{{.Title}}` with a quote in it corrupts the document — the driver refuses to send that rather
+  than shipping a half-parseable card. Write `"content":{{json .Title}}` (no surrounding quotes: the
+  helper emits a quoted, escaped JSON string literal) whenever the value comes from the message.
+- **A card on the message wins.** `lark/card` in `Extras` overrides any credential card, and keeps
+  its own rule of refusing a title or mention list it cannot place. A credential card does *not*
+  refuse them: it is a template, so it can put `{{.Title}}` wherever it likes.
+- **A missing key fails loudly.** Field-style lookups (`{{.Extras.peer}}`) on an absent key error at
+  send time rather than printing Go's `<no value>` into the card. `{{index .Extras "peer-id"}}` is
+  outside that check and still renders `<no value>`, so use the field style for optional keys.
+- The rendered card still passes the documented 20 KB request-body ceiling, measured after encoding.
+
 ## Extras
 
 | Key | Type | Effect |
 |-----|------|--------|
 | `lark/atUserIDs` | `[]string` / `string` | open_ids / user_ids to @ |
 | `lark/atAll` | `bool` | @ the whole group; needs the group's @所有人 permission, otherwise the send fails |
-| `lark/card` | any / JSON string / `[]byte` | Send this card structure verbatim under `card`, overriding anything derived from `Format` — a hand-built card, or a 搭建工具 template `{"type":"template","data":{"template_id":…}}`. Because it is sent untouched, a message that also carries `Title` or mentions is refused rather than silently stripped |
+| `lark/card` | any / JSON string / `[]byte` | Send this card structure verbatim under `card`, overriding both `Format` and any card configured in the credentials — a hand-built card, or a 搭建工具 template `{"type":"template","data":{"template_id":…}}`. Because it is sent untouched, a message that also carries `Title` or mentions is refused rather than silently stripped |
 
 The keys are exported as `ExtraAtUserIDs`, `ExtraAtAll` and `ExtraCard`; `MentionAll` is the `all`
 value a card's `<at id=all></at>` tag carries, and `MaxRequestBodyBytes` the ceiling below.
